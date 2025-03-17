@@ -101,7 +101,7 @@ wss.on("connection", (ws) => {
     console.log("WebSocket Client Connected");
 
     ws.on("message", async (message) => {
-        console.log(`📥 Received from WebSocket: ${message}`);
+        console.log(` Received from WebSocket: ${message}`);
 
         try {
             // Send message to Kafka
@@ -139,10 +139,10 @@ async function consumeKafkaMessages() {
         eachMessage: async ({ topic, partition, message }) => {
             try {
                 const receivedText = JSON.parse(message.value.toString());
-                console.log(`📥 Kafka DB Consumer Received:`, receivedText);
+                console.log(`Kafka DB Consumer Received:`, receivedText);
 
                 const geminiResponse = await getGeminiResponse(receivedText.message);
-                console.log(`🤖 Gemini Response: ${geminiResponse}`);
+                console.log(`Gemini Response: ${geminiResponse}`);
 
                 await messagesCollection.insertOne({
                     topic,
@@ -196,7 +196,7 @@ async function consumeRabbitMQMessages() {
     rabbitMQChannel.consume("dbUpdates", async (msg) => {
         if (msg !== null) {
             const receivedText = JSON.parse(msg.content.toString());
-            console.log(`📥 RabbitMQ DB Consumer Received:`, receivedText);
+            console.log(`RabbitMQ DB Consumer Received:`, receivedText);
 
             const geminiResponse = await getGeminiResponse(receivedText.message);
 
