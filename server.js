@@ -2,24 +2,38 @@ import { WebSocketServer, WebSocket } from "ws";
 import { Kafka } from "kafkajs";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { MongoClient } from "mongodb";
+import amqp from "amqplib";
 import dotenv from "dotenv";
 
 dotenv.config();
 
+// MongoDB Atlas Configuration
 const mongoClient = new MongoClient(process.env.MONGO_URI);
 const dbName = "chatDB";
 const collectionName = "messages";
 let db, messagesCollection;
 
+// Retry Utility Function
+async function retryOperation(operation, retries = 5, delay = 3000) {
+    for (let attempt = 1; attempt <= retries; attempt++) {
+        try {
+            return await operation();
+        } catch (error) {
+            console.error(`Retrying ${operation.name} (Attempt ${attempt}/${retries})...`);
+            await new Promise((res) => setTimeout(res, delay));
+        }
+    }
+    throw new Error(`${operation.name} failed after ${retries} attempts`);
+}
+
+// Connect to MongoDB Atlas with Retry
 async function connectToMongoDB() {
-    try {
+    await retryOperation(async () => {
         await mongoClient.connect();
         db = mongoClient.db(dbName);
         messagesCollection = db.collection(collectionName);
         console.log("Connected to MongoDB Atlas");
-    } catch (error) {
-        console.error("MongoDB Connection Error:", error);
-    }
+    });
 }
 connectToMongoDB();
 
@@ -30,99 +44,109 @@ async function getGeminiResponse(prompt) {
     try {
         const model = genAI.getGenerativeModel({ model: "gemini-1.5-pro" });
         const result = await model.generateContent(prompt);
-        console.log("📡 Gemini API Raw Response:", result);
 
-        // Extract and clean the response
+        if (!result || !result.response || !result.response.text) {
+            throw new Error("Invalid response from Gemini API");
+        }
+
         return cleanGeminiResponse(result.response.text());
     } catch (error) {
-        console.error("❌ Gemini API Error:", error);
+        console.error("Gemini API Error:", error);
         return `Error: ${error.message || "Unknown error"}`;
     }
 }
 
 // Function to clean Gemini's response formatting
 function cleanGeminiResponse(response) {
-    return response.replace(/```json|```/g, "").trim(); // Remove code block formatting
+    return response.replace(/```json|```/g, "").trim();
 }
 
 // Kafka Configuration
 const kafka = new Kafka({
     clientId: "websocket-server",
-    brokers: ["localhost:9092"], 
+    brokers: ["localhost:9092"],
 });
 
-const producer = kafka.producer();
+const kafkaProducer = kafka.producer();
 const dbConsumer = kafka.consumer({ groupId: "dbConsumerGroupTest" });
 const pubSubConsumer = kafka.consumer({ groupId: "pubSubConsumerGroup" });
 
+// Start Kafka Producer with Retry
 async function startKafkaProducer() {
-    try {
-        await producer.connect();
+    await retryOperation(async () => {
+        await kafkaProducer.connect();
         console.log("Kafka Producer Connected");
-    } catch (error) {
-        console.error("Kafka Producer Connection Error:", error);
-    }
+    });
 }
 startKafkaProducer();
 
-async function connectKafkaConsumer(consumer) {
-    let retries = 5;
-    while (retries > 0) {
-        try {
-            await consumer.connect();
-            console.log("Kafka Consumer Connected");
-            return;
-        } catch (error) {
-            console.error("Kafka Consumer Connection Error:", error);
-            retries--;
-            await new Promise((res) => setTimeout(res, 5000)); // Retry after 5 seconds
-        }
-    }
-    console.error("Failed to connect Kafka consumer after retries");
+// RabbitMQ Configuration
+let rabbitMQChannel;
+
+async function connectRabbitMQ() {
+    await retryOperation(async () => {
+        const connection = await amqp.connect("amqp://localhost:5672");
+        rabbitMQChannel = await connection.createChannel();
+        await rabbitMQChannel.assertQueue("dbUpdates");
+        await rabbitMQChannel.assertQueue("pubSubMessages");
+        console.log("RabbitMQ Connected");
+    });
 }
+connectRabbitMQ();
 
 // WebSocket Server
 const wss = new WebSocketServer({ port: 8080 });
 
 wss.on("connection", (ws) => {
+    console.log("WebSocket Client Connected");
+
     ws.on("message", async (message) => {
-        console.log(`Received from WebSocket: ${message}`);
+        console.log(`📥 Received from WebSocket: ${message}`);
 
-        await producer.send({
-            topic: "dbUpdates",
-            messages: [{ value: message }],
-        });
+        try {
+            // Send message to Kafka
+            await kafkaProducer.send({
+                topic: "dbUpdates",
+                messages: [{ value: message }],
+            });
 
-        console.log("Message sent to Kafka");
+            // Send message to RabbitMQ
+            if (rabbitMQChannel) {
+                rabbitMQChannel.sendToQueue("dbUpdates", Buffer.from(message));
+            }
+
+            console.log(" Message sent to Kafka & RabbitMQ");
+        } catch (error) {
+            console.error("Error processing WebSocket message:", error);
+        }
     });
 
     ws.on("close", () => console.log("Client disconnected"));
+    ws.on("error", (error) => console.error(" WebSocket Error:", error));
 });
 
 // Kafka Consumers
-async function consumeMessages() {
-    await connectKafkaConsumer(dbConsumer);
-    await connectKafkaConsumer(pubSubConsumer);
-
-    console.log("🔄 Subscribing to Kafka topics...");
+async function consumeKafkaMessages() {
+    await dbConsumer.connect();
     await dbConsumer.subscribe({ topic: "dbUpdates", fromBeginning: true });
+
+    await pubSubConsumer.connect();
     await pubSubConsumer.subscribe({ topic: "pubSubMessages", fromBeginning: true });
 
-    console.log("Subscribed successfully!");
+    console.log("Subscribed to Kafka topics");
 
-    // Handle dbConsumer messages
     dbConsumer.run({
         eachMessage: async ({ topic, partition, message }) => {
             try {
-                const receivedText = JSON.parse(message.value.toString()); // Convert to object
-                console.log(`📥 DB Consumer Received:`, receivedText);
+                const receivedText = JSON.parse(message.value.toString());
+                console.log(`📥 Kafka DB Consumer Received:`, receivedText);
 
                 const geminiResponse = await getGeminiResponse(receivedText.message);
                 console.log(`🤖 Gemini Response: ${geminiResponse}`);
 
                 await messagesCollection.insertOne({
                     topic,
-                    receivedText, // Now stored as an object
+                    receivedText,
                     geminiResponse,
                     timestamp: new Date(),
                 });
@@ -138,12 +162,11 @@ async function consumeMessages() {
         },
     });
 
-    // Handle pubSubConsumer messages
     pubSubConsumer.run({
         eachMessage: async ({ topic, partition, message }) => {
             try {
                 const receivedText = JSON.parse(message.value.toString());
-                console.log(`PubSub Consumer Received:`, receivedText);
+                console.log(`Kafka PubSub Consumer Received:`, receivedText);
 
                 const geminiResponse = await getGeminiResponse(receivedText.message);
 
@@ -160,23 +183,46 @@ async function consumeMessages() {
                     }
                 });
             } catch (error) {
-                console.error("Error processing PubSub message:", error);
+                console.error("Error processing Kafka PubSub message:", error);
             }
         },
     });
 }
 
-// Start Kafka Consumers
-consumeMessages().catch(console.error);
+// RabbitMQ Consumers
+async function consumeRabbitMQMessages() {
+    if (!rabbitMQChannel) return;
 
-// Graceful Shutdown
-process.on("SIGINT", async () => {
-    console.log(" Closing MongoDB and Kafka connections...");
-    await mongoClient.close();
-    await producer.disconnect();
-    await dbConsumer.disconnect();
-    await pubSubConsumer.disconnect();
-    process.exit(0);
-});
+    rabbitMQChannel.consume("dbUpdates", async (msg) => {
+        if (msg !== null) {
+            const receivedText = JSON.parse(msg.content.toString());
+            console.log(`📥 RabbitMQ DB Consumer Received:`, receivedText);
 
-console.log("WebSocket server running on ws://localhost:8080");
+            const geminiResponse = await getGeminiResponse(receivedText.message);
+
+            await messagesCollection.insertOne({
+                topic: "dbUpdates",
+                receivedText,
+                geminiResponse,
+                timestamp: new Date(),
+            });
+
+            wss.clients.forEach((client) => {
+                if (client.readyState === WebSocket.OPEN) {
+                    client.send(JSON.stringify({ from: "Gemini", message: geminiResponse }));
+                }
+            });
+
+            rabbitMQChannel.ack(msg);
+        }
+    });
+
+    console.log("RabbitMQ Consumers Listening...");
+}
+
+// Start Consumers
+consumeKafkaMessages().catch(console.error);
+setTimeout(consumeRabbitMQMessages, 5000); // Delay to ensure RabbitMQ connection
+
+console.log("WebSocket Server running on ws://localhost:8080");
+

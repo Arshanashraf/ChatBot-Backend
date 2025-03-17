@@ -1,11 +1,13 @@
 version: '3'
 services:
+  # Zookeeper for Kafka
   zookeeper:
     image: wurstmeister/zookeeper
     container_name: zookeeper
     ports:
       - "2181:2181"
 
+  # Kafka Broker
   kafka:
     image: wurstmeister/kafka
     container_name: kafkakafka
@@ -18,3 +20,20 @@ services:
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
     depends_on:
       - zookeeper
+
+  # RabbitMQ Server
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq
+    restart: always
+    ports:
+      - "5672:5672"   # AMQP (Messaging Protocol)
+      - "15672:15672" # Management UI
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    healthcheck:
+      test: ["CMD", "rabbitmqctl", "status"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
